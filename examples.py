@@ -28,7 +28,7 @@ def basic_usage():
     chat = ChatQwen(
         temperature=0.7,
         model="qwen-plus",
-        dashscope_api_key=SecretStr(api_key_dashscope)
+        api_key=SecretStr(api_key_dashscope)
     )
     
     # 创建消息
@@ -51,7 +51,7 @@ def streaming_example():
         temperature=0.7,
         model="qwen-plus",
         streaming=True,
-        dashscope_api_key=SecretStr(api_key_dashscope)
+        api_key=SecretStr(api_key_dashscope)
     )
     
     # 创建消息
@@ -94,7 +94,7 @@ def structured_output_example():
     chat = ChatQwen(
         temperature=0.1,  # 结构化输出需要较低的温度以提高确定性
         model="qwen-plus",
-        dashscope_api_key=SecretStr(api_key_dashscope)
+        api_key=SecretStr(api_key_dashscope)
     )
     
     # 配置结构化输出
@@ -122,7 +122,7 @@ async def async_example():
     chat = ChatQwen(
         temperature=0.7,
         model="qwen-plus",
-        dashscope_api_key=SecretStr(api_key_dashscope)
+        api_key=SecretStr(api_key_dashscope)
     )
     
     # 创建消息
@@ -155,7 +155,7 @@ def batch_example():
     chat = ChatQwen(
         temperature=0.7,
         model="qwen-plus",
-        dashscope_api_key=SecretStr(api_key_dashscope)
+        api_key=SecretStr(api_key_dashscope)
     )
     
     # 创建多组消息
@@ -191,7 +191,7 @@ async def async_streaming_example():
         temperature=0.7,
         model="qwen-plus",
         streaming=True,
-        dashscope_api_key=SecretStr(api_key_dashscope)
+        api_key=SecretStr(api_key_dashscope)
     )
     
     # 创建消息
