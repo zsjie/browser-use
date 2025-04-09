@@ -36,6 +36,7 @@ from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
     SystemMessage,
+    ToolMessage,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables import Runnable, RunnableConfig
@@ -54,6 +55,8 @@ def _convert_message_to_dashscope(message: BaseMessage) -> Dict[str, Any]:
         return {"role": "user", "content": message.content}
     elif isinstance(message, AIMessage):
         return {"role": "assistant", "content": message.content}
+    elif isinstance(message, ToolMessage):
+        return {"role": "tool", "content": message.content}
     else:
         raise ValueError(f"未支持的消息类型: {type(message)}")
 
@@ -84,7 +87,7 @@ class ChatQwen(BaseChatModel):
         max_tokens: 最大生成长度
         top_p: 核采样多样性参数
         top_k: 核采样多样性参数
-        dashscope_api_key: Dashscope API密钥
+        api_key: Dashscope API密钥
         stop: 停止词列表
         streaming: 是否启用流式输出
         request_timeout: 请求超时时间
@@ -97,7 +100,7 @@ class ChatQwen(BaseChatModel):
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
-    dashscope_api_key: Optional[SecretStr] = None
+    api_key: SecretStr
     stop: Optional[List[str]] = None
     streaming: bool = False
     request_timeout: Optional[int] = None
@@ -115,20 +118,17 @@ class ChatQwen(BaseChatModel):
             raise ValueError("temperature必须在0到1之间")
         return v
 
-    # 验证环境变量和初始化
+    # 验证API密钥
     @model_validator(mode="before")
     @classmethod
     def validate_environment(cls, values: Dict) -> Dict:
-        """验证环境变量和API密钥。"""
-        # 获取API密钥
-        api_key = get_from_dict_or_env(
-            values, "dashscope_api_key", "DASHSCOPE_API_KEY"
-        )
+        """验证API密钥。"""
+        api_key = values.get("api_key")
         
         if isinstance(api_key, str):
-            values["dashscope_api_key"] = SecretStr(api_key)
-        else:
-            values["dashscope_api_key"] = api_key
+            values["api_key"] = SecretStr(api_key)
+        elif api_key is None:
+            raise ValueError("必须提供 api_key")
             
         return values
     
@@ -139,9 +139,7 @@ class ChatQwen(BaseChatModel):
 
     def _get_api_key(self) -> str:
         """获取API密钥。"""
-        if self.dashscope_api_key:
-            return self.dashscope_api_key.get_secret_value()
-        return os.getenv("DASHSCOPE_API_KEY", "")
+        return self.api_key.get_secret_value()
 
     def _convert_params(self) -> Dict[str, Any]:
         """构建API请求参数。"""
