@@ -20,15 +20,15 @@ from pydantic import SecretStr
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import asyncio
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 
 from browser_use import Agent, Controller
 from browser_use.browser.browser import Browser, BrowserConfig
 
 load_dotenv()
-api_key = os.getenv('GEMINI_API_KEY')
+api_key = os.getenv('QWEN_API_KEY')
 if not api_key:
-	raise ValueError('GEMINI_API_KEY is not set')
+	raise ValueError('QWEN_API_KEY is not set')
 
 browser = Browser(
 	config=BrowserConfig(
@@ -40,9 +40,13 @@ controller = Controller()
 
 
 async def main():
-	task = 'In docs.google.com write my Papa a quick thank you for everything letter \n - Magnus'
-	task += ' and save the document as pdf'
-	model = ChatGoogleGenerativeAI(model='gemini-2.0-flash-exp', api_key=SecretStr(str(api_key)))
+	task = 'go to google.com'
+	task += ' and search dashscope'
+	model = ChatOpenAI(
+			base_url='https://dashscope.aliyuncs.com/compatible-mode/v1',
+			model='qwen2.5-32b-instruct',
+			api_key=SecretStr(api_key),
+		)
 	agent = Agent(
 		task=task,
 		llm=model,
