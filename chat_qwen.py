@@ -793,7 +793,7 @@ class ChatQwen(BaseChatModel):
         """直接调用模型，与Browser-use Agent兼容。
         
         重写基类的invoke方法，确保返回格式与Browser-use Agent兼容。
-        Browser-use Agent期望的返回格式中parsed字段需要有action属性。
+        Browser-use Agent期望的返回格式中parsed字段是一个有.action属性的对象，不是字典。
         """
         # 记录调用信息
         logger.debug(f"调用invoke方法，输入消息数量: {len(input)}")
@@ -818,43 +818,64 @@ class ChatQwen(BaseChatModel):
                         parsed_content = json.loads(content)
                         logger.debug(f"成功解析JSON内容: {type(parsed_content)}")
                         
-                        # 创建Pydantic模型对象
-                        current_state_data = parsed_content.get("current_state", {})
-                        current_state = CurrentState(**current_state_data)
+                        # 创建一个对象，将字典转换为具有属性的对象
+                        class ObjectifiedDict:
+                            def __init__(self, d):
+                                self.__dict__.update(d)
+                                # 特殊处理action字段，确保它是一个列表
+                                if 'action' in d:
+                                    actions = d['action']
+                                    if isinstance(actions, list):
+                                        # 将action列表中的每个字典转换为对象
+                                        self.action = [ObjectifiedDict(a) if isinstance(a, dict) else a for a in actions]
+                                    else:
+                                        self.action = [ObjectifiedDict(actions) if isinstance(actions, dict) else actions]
+                                else:
+                                    self.action = []
+                                
+                                # 特殊处理current_state字段
+                                if 'current_state' in d:
+                                    self.current_state = ObjectifiedDict(d['current_state']) if isinstance(d['current_state'], dict) else d['current_state']
+                            
+                            def model_dump(self, *args, **kwargs):
+                                """提供与Pydantic模型兼容的model_dump方法"""
+                                return self.__dict__
+                            
+                            def model_dump_json(self, *args, **kwargs):
+                                """提供与Pydantic模型兼容的model_dump_json方法"""
+                                import json
+                                return json.dumps(self.__dict__)
+                                
+                            def get_index(self):
+                                """提供与Action模型兼容的get_index方法"""
+                                if hasattr(self, 'index'):
+                                    return self.index
+                                return None
+                                
+                            def set_index(self, index):
+                                """提供与Action模型兼容的set_index方法"""
+                                self.index = index
                         
-                        # 处理动作列表
-                        actions = []
-                        for action_dict in parsed_content.get("action", []):
-                            if action_dict:
-                                # 从第一个键值对创建动态模型
-                                action_name = list(action_dict.keys())[0]
-                                action_value = action_dict[action_name]
-                                # 创建Action对象并添加动态属性
-                                action = Action(**{action_name: action_value})
-                                actions.append(action)
+                        # 用我们的ObjectifiedDict类转换解析的内容
+                        objectified = ObjectifiedDict(parsed_content)
                         
-                        # 创建最终的AgentOutput对象
-                        agent_output = AgentOutput(
-                            current_state=current_state,
-                            action=actions
-                        )
-                        
-                        return {"parsed": agent_output, "raw": message}
+                        # 返回符合期望格式的对象
+                        return {"parsed": objectified, "raw": message}
                     except json.JSONDecodeError as e:
                         logger.warning(f"无法将返回内容解析为JSON: {e}")
                 
                 # 如果内容不是JSON或解析失败，作为原始内容返回
-                return {"parsed": content, "raw": message}
+                return {"parsed": None, "raw": message}
             
             # 没有生成内容的情况
             logger.warning("模型没有生成任何内容")
-            return {"parsed": {}, "raw": None}
+            return {"parsed": None, "raw": None}
             
         except Exception as e:
             # 捕获所有异常，确保不会崩溃
             logger.error(f"invoke方法发生错误: {e}", exc_info=True)
             # 返回错误信息
-            return {"parsed": {"error": str(e)}, "raw": None}
+            return {"parsed": None, "raw": None, "error": str(e)}
     
     async def ainvoke(
         self,
@@ -865,7 +886,7 @@ class ChatQwen(BaseChatModel):
         """异步调用模型，与Browser-use Agent兼容。
         
         重写基类的ainvoke方法，确保返回格式与Browser-use Agent兼容。
-        Browser-use Agent期望的返回格式中parsed字段需要有action属性。
+        Browser-use Agent期望的返回格式中parsed字段是一个有.action属性的对象，不是字典。
         """
         # 记录调用信息
         logger.debug(f"调用ainvoke方法，输入消息数量: {len(input)}")
@@ -890,43 +911,64 @@ class ChatQwen(BaseChatModel):
                         parsed_content = json.loads(content)
                         logger.debug(f"成功解析JSON内容: {type(parsed_content)}")
                         
-                        # 创建Pydantic模型对象
-                        current_state_data = parsed_content.get("current_state", {})
-                        current_state = CurrentState(**current_state_data)
+                        # 创建一个对象，将字典转换为具有属性的对象
+                        class ObjectifiedDict:
+                            def __init__(self, d):
+                                self.__dict__.update(d)
+                                # 特殊处理action字段，确保它是一个列表
+                                if 'action' in d:
+                                    actions = d['action']
+                                    if isinstance(actions, list):
+                                        # 将action列表中的每个字典转换为对象
+                                        self.action = [ObjectifiedDict(a) if isinstance(a, dict) else a for a in actions]
+                                    else:
+                                        self.action = [ObjectifiedDict(actions) if isinstance(actions, dict) else actions]
+                                else:
+                                    self.action = []
+                                
+                                # 特殊处理current_state字段
+                                if 'current_state' in d:
+                                    self.current_state = ObjectifiedDict(d['current_state']) if isinstance(d['current_state'], dict) else d['current_state']
+                            
+                            def model_dump(self, *args, **kwargs):
+                                """提供与Pydantic模型兼容的model_dump方法"""
+                                return self.__dict__
+                            
+                            def model_dump_json(self, *args, **kwargs):
+                                """提供与Pydantic模型兼容的model_dump_json方法"""
+                                import json
+                                return json.dumps(self.__dict__)
+                                
+                            def get_index(self):
+                                """提供与Action模型兼容的get_index方法"""
+                                if hasattr(self, 'index'):
+                                    return self.index
+                                return None
+                                
+                            def set_index(self, index):
+                                """提供与Action模型兼容的set_index方法"""
+                                self.index = index
                         
-                        # 处理动作列表
-                        actions = []
-                        for action_dict in parsed_content.get("action", []):
-                            if action_dict:
-                                # 从第一个键值对创建动态模型
-                                action_name = list(action_dict.keys())[0]
-                                action_value = action_dict[action_name]
-                                # 创建Action对象并添加动态属性
-                                action = Action(**{action_name: action_value})
-                                actions.append(action)
+                        # 用我们的ObjectifiedDict类转换解析的内容
+                        objectified = ObjectifiedDict(parsed_content)
                         
-                        # 创建最终的AgentOutput对象
-                        agent_output = AgentOutput(
-                            current_state=current_state,
-                            action=actions
-                        )
-                        
-                        return {"parsed": agent_output, "raw": message}
+                        # 返回符合期望格式的对象
+                        return {"parsed": objectified, "raw": message}
                     except json.JSONDecodeError as e:
                         logger.warning(f"无法将返回内容解析为JSON: {e}")
                 
                 # 如果内容不是JSON或解析失败，作为原始内容返回
-                return {"parsed": content, "raw": message}
+                return {"parsed": None, "raw": message}
             
             # 没有生成内容的情况
             logger.warning("模型没有生成任何内容")
-            return {"parsed": {}, "raw": None}
+            return {"parsed": None, "raw": None}
             
         except Exception as e:
             # 捕获所有异常，确保不会崩溃
             logger.error(f"ainvoke方法发生错误: {e}", exc_info=True)
             # 返回错误信息
-            return {"parsed": {"error": str(e)}, "raw": None}
+            return {"parsed": None, "raw": None, "error": str(e)}
         
     def bind_tools(
         self,
