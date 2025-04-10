@@ -622,7 +622,6 @@ class BaseChatDashscope(BaseChatModel):
             if self.dashscope_proxy and not self.http_client:
                 try:
                     import httpx
-                    from httpx import AsyncClient
                 except ImportError as e:
                     raise ImportError(
                         "Could not import httpx python package. "
@@ -632,13 +631,12 @@ class BaseChatDashscope(BaseChatModel):
                     proxy=self.dashscope_proxy, verify=global_ssl_context
                 )
             sync_specific = {"http_client": self.http_client}
-            self.root_client = httpx.Client(**client_params, **sync_specific) # type: ignore
+            self.root_client = openai.OpenAI(**client_params, **sync_specific) # type: ignore
             self.client = self.root_client.chat.completions
         if not self.async_client:
             if self.dashscope_proxy and not self.http_async_client:
                 try:
                     import httpx
-                    from httpx import AsyncClient
                 except ImportError as e:
                     raise ImportError(
                         "Could not import httpx python package. "
@@ -648,7 +646,7 @@ class BaseChatDashscope(BaseChatModel):
                     proxy=self.dashscope_proxy, verify=global_ssl_context
                 )
                 async_specific = {"http_client": self.http_async_client}
-                self.root_async_client = httpx.AsyncClient(**client_params, **async_specific)
+                self.root_async_client = openai.AsyncOpenAI(**client_params, **async_specific) # type: ignore
                 self.async_client = self.root_async_client.chat.completions
         return self
     
