@@ -8,11 +8,12 @@ To test this locally, follow these steps:
 3. Open a web browser and navigate to `http://localhost:9222/json/version` to verify that the Remote Debugging Protocol (CDP) is running.
 4. Launch this example.
 
-@dev You need to set the `GEMINI_API_KEY` environment variable before proceeding.
+@dev You need to set the `QWEN_API_KEY` environment variable before proceeding.
 """
 
 import os
 import sys
+from typing import cast
 
 from dotenv import load_dotenv
 from pydantic import SecretStr
@@ -28,9 +29,14 @@ from browser_use.browser.browser import Browser, BrowserConfig
 from chat_qwen import ChatQwen
 
 load_dotenv()
-api_key = os.getenv('QWEN_API_KEY')
-if not api_key:
+
+# 获取并验证API密钥
+api_key_raw = os.getenv('QWEN_API_KEY')
+if not api_key_raw:
 	raise ValueError('QWEN_API_KEY is not set')
+
+# 创建SecretStr
+api_key = SecretStr(api_key_raw)
 
 browser = Browser(
 	config=BrowserConfig(
@@ -45,14 +51,15 @@ async def main():
 	task = 'go to google.com'
 	task += ' and search dashscope'
 	model = ChatQwen(
-			model='qwen2.5-32b-instruct',
-			api_key=SecretStr(api_key),
-		)
+		model='qwen2.5-32b-instruct',
+		api_key=api_key,
+	)
 	agent = Agent(
 		task=task,
 		llm=model,
 		controller=controller,
 		browser=browser,
+		max_failures=1
 	)
 
 	await agent.run()
