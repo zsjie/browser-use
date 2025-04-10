@@ -53,7 +53,7 @@ from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResu
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import BaseTool
 from langchain_core.utils import get_from_dict_or_env
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator, BaseModel, ConfigDict
 
 # 类型变量定义
 T = TypeVar("T")
@@ -61,6 +61,44 @@ T = TypeVar("T")
 # 设置日志级别
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# 为Action和AgentOutput创建Pydantic模型
+class Action(BaseModel):
+    """表示单个动作的模型"""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
+    # 动态属性，会在运行时添加
+    # 例如go_to_url或click_element等
+
+    def get_index(self) -> int | None:
+        """获取动作的索引"""
+        for field_name, field_value in self.model_dump().items():
+            if isinstance(field_value, dict) and "index" in field_value:
+                return field_value["index"]
+        return None
+
+    def set_index(self, index: int) -> None:
+        """设置动作的索引"""
+        for field_name in self.model_fields_set:
+            field_value = getattr(self, field_name)
+            if isinstance(field_value, dict) and "index" in field_value:
+                field_value["index"] = index
+
+
+class CurrentState(BaseModel):
+    """Agent当前状态模型"""
+    evaluation_previous_goal: Optional[str] = None
+    memory: Optional[str] = None
+    next_goal: Optional[str] = None
+    page_summary: Optional[str] = None
+
+
+class AgentOutput(BaseModel):
+    """Agent输出模型"""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
+    current_state: CurrentState
+    action: List[Action]
 
 
 def _convert_message_to_dashscope(message: BaseMessage) -> Dict[str, Any]:
@@ -755,37 +793,68 @@ class ChatQwen(BaseChatModel):
         """直接调用模型，与Browser-use Agent兼容。
         
         重写基类的invoke方法，确保返回格式与Browser-use Agent兼容。
+        Browser-use Agent期望的返回格式中parsed字段需要有action属性。
         """
         # 记录调用信息
-        logger.info(f"调用invoke方法，输入消息数量: {len(input)}")
+        logger.debug(f"调用invoke方法，输入消息数量: {len(input)}")
         
-        # 调用底层的生成方法
-        result = self._generate(input, **kwargs)
-        
-        # 获取AIMessage内容
-        if result and result.generations and len(result.generations) > 0:
-            message = result.generations[0].message
+        try:
+            # 调用底层的生成方法
+            result = self._generate(input, **kwargs)
             
-            # 记录完整消息
-            logger.info(f"完整的返回消息: {message}")
-            content = message.content
+            # 获取AIMessage内容
+            if result and result.generations and len(result.generations) > 0:
+                message = result.generations[0].message
+                
+                # 记录完整消息
+                logger.debug(f"完整的返回消息: {message}")
+                content = message.content
+                
+                # 检查内容是否是JSON字符串
+                if isinstance(content, str) and (content.strip().startswith('{') or content.strip().startswith('[')):
+                    import json
+                    try:
+                        # 尝试解析JSON字符串为Python对象
+                        parsed_content = json.loads(content)
+                        logger.debug(f"成功解析JSON内容: {type(parsed_content)}")
+                        
+                        # 创建Pydantic模型对象
+                        current_state_data = parsed_content.get("current_state", {})
+                        current_state = CurrentState(**current_state_data)
+                        
+                        # 处理动作列表
+                        actions = []
+                        for action_dict in parsed_content.get("action", []):
+                            if action_dict:
+                                # 从第一个键值对创建动态模型
+                                action_name = list(action_dict.keys())[0]
+                                action_value = action_dict[action_name]
+                                # 创建Action对象并添加动态属性
+                                action = Action(**{action_name: action_value})
+                                actions.append(action)
+                        
+                        # 创建最终的AgentOutput对象
+                        agent_output = AgentOutput(
+                            current_state=current_state,
+                            action=actions
+                        )
+                        
+                        return {"parsed": agent_output, "raw": message}
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"无法将返回内容解析为JSON: {e}")
+                
+                # 如果内容不是JSON或解析失败，作为原始内容返回
+                return {"parsed": content, "raw": message}
             
-            # 检查内容是否是JSON字符串
-            if isinstance(content, str) and (content.strip().startswith('{') or content.strip().startswith('[')):
-                import json
-                try:
-                    # 尝试解析JSON字符串为Python对象并返回
-                    parsed_content = json.loads(content)
-                    logger.info(f"成功解析JSON内容: {type(parsed_content)}")
-                    return parsed_content
-                except json.JSONDecodeError as e:
-                    logger.warning(f"无法将返回内容解析为JSON: {e}")
+            # 没有生成内容的情况
+            logger.warning("模型没有生成任何内容")
+            return {"parsed": {}, "raw": None}
             
-            # 不是有效的JSON或解析失败，返回原始内容
-            return content
-        
-        # 如果没有生成内容，返回空字典
-        return {}
+        except Exception as e:
+            # 捕获所有异常，确保不会崩溃
+            logger.error(f"invoke方法发生错误: {e}", exc_info=True)
+            # 返回错误信息
+            return {"parsed": {"error": str(e)}, "raw": None}
     
     async def ainvoke(
         self,
@@ -796,37 +865,68 @@ class ChatQwen(BaseChatModel):
         """异步调用模型，与Browser-use Agent兼容。
         
         重写基类的ainvoke方法，确保返回格式与Browser-use Agent兼容。
+        Browser-use Agent期望的返回格式中parsed字段需要有action属性。
         """
         # 记录调用信息
-        logger.info(f"调用ainvoke方法，输入消息数量: {len(input)}")
+        logger.debug(f"调用ainvoke方法，输入消息数量: {len(input)}")
         
-        # 调用底层的异步生成方法
-        result = await self._agenerate(input, **kwargs)
-        
-        # 获取AIMessage内容
-        if result and result.generations and len(result.generations) > 0:
-            message = result.generations[0].message
+        try:
+            # 调用底层的异步生成方法
+            result = await self._agenerate(input, **kwargs)
             
-            # 记录完整消息
-            logger.info(f"完整的返回消息: {message}")
-            content = message.content
+            # 获取AIMessage内容
+            if result and result.generations and len(result.generations) > 0:
+                message = result.generations[0].message
+                
+                # 记录完整消息
+                logger.debug(f"完整的返回消息: {message}")
+                content = message.content
+                
+                # 检查内容是否是JSON字符串
+                if isinstance(content, str) and (content.strip().startswith('{') or content.strip().startswith('[')):
+                    import json
+                    try:
+                        # 尝试解析JSON字符串为Python对象
+                        parsed_content = json.loads(content)
+                        logger.debug(f"成功解析JSON内容: {type(parsed_content)}")
+                        
+                        # 创建Pydantic模型对象
+                        current_state_data = parsed_content.get("current_state", {})
+                        current_state = CurrentState(**current_state_data)
+                        
+                        # 处理动作列表
+                        actions = []
+                        for action_dict in parsed_content.get("action", []):
+                            if action_dict:
+                                # 从第一个键值对创建动态模型
+                                action_name = list(action_dict.keys())[0]
+                                action_value = action_dict[action_name]
+                                # 创建Action对象并添加动态属性
+                                action = Action(**{action_name: action_value})
+                                actions.append(action)
+                        
+                        # 创建最终的AgentOutput对象
+                        agent_output = AgentOutput(
+                            current_state=current_state,
+                            action=actions
+                        )
+                        
+                        return {"parsed": agent_output, "raw": message}
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"无法将返回内容解析为JSON: {e}")
+                
+                # 如果内容不是JSON或解析失败，作为原始内容返回
+                return {"parsed": content, "raw": message}
             
-            # 检查内容是否是JSON字符串
-            if isinstance(content, str) and (content.strip().startswith('{') or content.strip().startswith('[')):
-                import json
-                try:
-                    # 尝试解析JSON字符串为Python对象并返回
-                    parsed_content = json.loads(content)
-                    logger.info(f"成功解析JSON内容: {type(parsed_content)}")
-                    return parsed_content
-                except json.JSONDecodeError as e:
-                    logger.warning(f"无法将返回内容解析为JSON: {e}")
+            # 没有生成内容的情况
+            logger.warning("模型没有生成任何内容")
+            return {"parsed": {}, "raw": None}
             
-            # 不是有效的JSON或解析失败，返回原始内容
-            return content
-        
-        # 如果没有生成内容，返回空字典
-        return {}
+        except Exception as e:
+            # 捕获所有异常，确保不会崩溃
+            logger.error(f"ainvoke方法发生错误: {e}", exc_info=True)
+            # 返回错误信息
+            return {"parsed": {"error": str(e)}, "raw": None}
         
     def bind_tools(
         self,
