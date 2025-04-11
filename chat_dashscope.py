@@ -108,6 +108,9 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic.v1 import BaseModel as BaseModelV1
 from typing_extensions import Self
 
+from dashscope.api_entities.dashscope_response import (GenerationResponse,
+                                                       Message, Role)
+
 if TYPE_CHECKING:
     from openai.types.responses import Response
 
@@ -844,6 +847,83 @@ class BaseChatDashscope(BaseChatModel):
             if isinstance(source, bool):
                 return source
         return self.stream_usage
+
+    def _get_dashscope_role(self, message: BaseMessage) -> str:
+        if isinstance(message, HumanMessage):
+            role = "user"
+        elif isinstance(message, AIMessage):
+            role = "assistant"
+        elif isinstance(message, SystemMessage):
+            role = "system"
+        elif isinstance(message, FunctionMessage):
+            role = "bot"
+        elif isinstance(message, ToolMessage):
+            role = "bot"
+        elif isinstance(message, ChatMessage):
+            role = "user"
+        else:
+            msg = f"Got unsupported message type: {message}"
+            raise ValueError(msg)  # noqa: TRY004
+        return role
+            
+
+    def _convert_to_dashscope_message(self, messages: List[BaseMessage]) -> List[Message]:
+        """Convert a list of BaseMessage to a list of dict."""
+        dashscope_messages = []
+        for message in messages:
+            if isinstance(message.content, str):
+                dashscope_messages.append({
+                    "role": self._get_dashscope_role(message),
+                    "content": message.content,
+                })
+            elif isinstance(message.content, list):
+                # 处理多模态内容
+                content = []
+                for item in message.content:
+                    if isinstance(item, str):
+                        content.append({"text": item})
+                    elif isinstance(item, dict):
+                        content.append(item)
+                dashscope_messages.append({
+                    "role": self._get_dashscope_role(message),
+                    "content": content
+                })
+        return dashscope_messages
+    
+    def __get_request_payload_dashscope(
+        self,
+        input_: LanguageModelInput,
+        *,
+        stop: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> dict:
+        messages = self._convert_input(input_).to_messages()
+        
+        if stop is not None:
+            kwargs["stop"] = stop
+
+        payload = {**self._default_params, **kwargs}
+        if self._use_responses_api(payload):
+            payload = _construct_responses_api_payload(messages, payload)
+        else:
+            payload["messages"] = [_convert_message_to_dict(m) for m in messages]
+        return payload
+    
+    def _stream_dashscope(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        *,
+        stream_usage: Optional[bool] = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
+        kwargs["stream"] = True
+        # stream_usage = self._should_stream_usage(stream_usage, **kwargs)
+        # if stream_usage:
+        #     kwargs["stream_options"] = {"include_usage": stream_usage}
+
+        return self._stream_responses(messages, stop, run_manager, **kwargs)
 
     def _stream(
         self,
