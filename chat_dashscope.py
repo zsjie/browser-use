@@ -872,22 +872,10 @@ class BaseChatDashscope(BaseChatModel):
         dashscope_messages = []
         for message in messages:
             if isinstance(message.content, str):
-                dashscope_messages.append({
-                    "role": self._get_dashscope_role(message),
-                    "content": message.content,
-                })
-            elif isinstance(message.content, list):
-                # 处理多模态内容
-                content = []
-                for item in message.content:
-                    if isinstance(item, str):
-                        content.append({"text": item})
-                    elif isinstance(item, dict):
-                        content.append(item)
-                dashscope_messages.append({
-                    "role": self._get_dashscope_role(message),
-                    "content": content
-                })
+                dashscope_messages.append(Message(role=self._get_dashscope_role(message), content=message.content))
+            else:
+                # TODO: 处理多模态内容
+                raise ValueError(f"Unsupported message content type: {type(message.content)}")
         return dashscope_messages
     
     def __get_request_payload_dashscope(
@@ -897,7 +885,7 @@ class BaseChatDashscope(BaseChatModel):
         stop: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> dict:
-        messages = self._convert_input(input_).to_messages()
+        messages = self._convert_to_dashscope_message(self._convert_input(input_).to_messages())
         
         if stop is not None:
             kwargs["stop"] = stop
