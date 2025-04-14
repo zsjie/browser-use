@@ -577,6 +577,33 @@ class BaseChatDashscope(BaseChatModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
+    plugins: Optional[Union[str, Dict[str, Any]]] = None
+    """插件配置，可以是插件配置字符串或字典"""
+
+    workspace: Optional[str] = None
+    """DashScope工作空间ID"""
+
+    stream: Optional[bool] = False
+    """是否启用服务器发送事件，默认为False"""
+
+    top_k: Optional[int] = 0
+    """生成时的候选集大小，默认为0"""
+
+    enable_search: Optional[bool] = False
+    """是否启用搜索，默认为False"""
+
+    customized_model_id: Optional[str] = None
+    """企业特定的大模型ID"""
+
+    result_format: Optional[str] = None
+    """结果格式，可选message或text"""
+
+    incremental_output: Optional[bool] = False
+    """控制流式输出模式，默认为False"""
+
+    repetition_penalty: Optional[float] = None
+    """控制生成时的重复性，1.0表示无惩罚"""
+
     @model_validator(mode="before")
     @classmethod
     def build_extra(cls, values: Dict[str, Any]) -> Any:
@@ -885,16 +912,17 @@ class BaseChatDashscope(BaseChatModel):
         stop: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> dict:
+        
         messages = self._convert_to_dashscope_message(self._convert_input(input_).to_messages())
         
         if stop is not None:
             kwargs["stop"] = stop
 
         payload = {**self._default_params, **kwargs}
-        if self._use_responses_api(payload):
-            payload = _construct_responses_api_payload(messages, payload)
-        else:
-            payload["messages"] = [_convert_message_to_dict(m) for m in messages]
+        # if self._use_responses_api(payload):
+        #     payload = _construct_responses_api_payload(messages, payload)
+        # else:
+        #     payload["messages"] = [_convert_message_to_dict(m) for m in messages]
         return payload
     
     def _stream_dashscope(
