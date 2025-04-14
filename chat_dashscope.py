@@ -708,6 +708,30 @@ class BaseChatDashscope(BaseChatModel):
 
         return params
     
+    @property
+    def _default_params_dashscope(self) -> Dict[str, Any]:
+        """Get the default parameters for calling Dashscope API."""
+        exclude_if_none = {
+            "plugins": self.plugins,
+            "workspace": self.workspace,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "enable_search": self.enable_search,
+            "customized_model_id": self.customized_model_id,
+            "result_format": self.result_format,
+            "incremental_output": self.incremental_output,
+            "stop": self.stop or None,
+            "max_tokens": self.max_tokens,
+            "repetition_penalty": self.repetition_penalty,
+        }
+        params = {
+            "model": self.model_name,
+            "stream": self.stream,
+            **{k: v for k, v in exclude_if_none.items() if v is not None},
+        }
+        return params
+    
     def _combine_llm_outputs(self, llm_outputs: List[Optional[dict]]) -> dict:
         overall_token_usage: dict = {}
         system_fingerprint = None
