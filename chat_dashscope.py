@@ -111,6 +111,8 @@ from typing_extensions import Self
 from dashscope.api_entities.dashscope_response import (GenerationResponse,
                                                        Message, Role)
 
+from dashscope import Generation
+
 if TYPE_CHECKING:
     from openai.types.responses import Response
 
@@ -458,6 +460,8 @@ class BaseChatDashscope(BaseChatModel):
     async_client: Any = Field(default=None, exclude=True)  #: :meta private:
     root_client: Any = Field(default=None, exclude=True)  #: :meta private:
     root_async_client: Any = Field(default=None, exclude=True)  #: :meta private:
+
+
     model_name: str = Field(default="qwen-turbo", alias="model")
     """Model name to use."""
     temperature: Optional[float] = None
@@ -728,6 +732,7 @@ class BaseChatDashscope(BaseChatModel):
         params = {
             "model": self.model_name,
             "stream": self.stream,
+            "api_key": self.dashscope_api_key.get_secret_value() if self.dashscope_api_key else None,
             **{k: v for k, v in exclude_if_none.items() if v is not None},
         }
         return params
@@ -929,7 +934,7 @@ class BaseChatDashscope(BaseChatModel):
                 raise ValueError(f"Unsupported message content type: {type(message.content)}")
         return dashscope_messages
     
-    def __get_request_payload_dashscope(
+    def _get_request_payload_dashscope(
         self,
         input_: LanguageModelInput,
         *,
@@ -942,11 +947,8 @@ class BaseChatDashscope(BaseChatModel):
         if stop is not None:
             kwargs["stop"] = stop
 
-        payload = {**self._default_params, **kwargs}
-        # if self._use_responses_api(payload):
-        #     payload = _construct_responses_api_payload(messages, payload)
-        # else:
-        #     payload["messages"] = [_convert_message_to_dict(m) for m in messages]
+        payload = {**self._default_params_dashscope, **kwargs}
+        payload["messages"] = messages
         return payload
     
     def _stream_dashscope(
@@ -959,11 +961,58 @@ class BaseChatDashscope(BaseChatModel):
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
         kwargs["stream"] = True
-        # stream_usage = self._should_stream_usage(stream_usage, **kwargs)
-        # if stream_usage:
-        #     kwargs["stream_options"] = {"include_usage": stream_usage}
 
-        return self._stream_responses(messages, stop, run_manager, **kwargs)
+        if stream_usage is not None:
+            warnings.warn("stream_usage is not supported in Dashscope. "
+                          "Token usage will be included in the response by default."
+            )
+
+        payload = self._get_request_payload_dashscope(messages, stop=stop, **kwargs)
+        
+        # Call Generation API with streaming
+        response_stream = Generation.call(**payload)
+        
+        # Convert each GenerationResponse to ChatGenerationChunk
+        for response in response_stream:
+            # Extract content from the first choice's message
+            content = ""
+            finish_reason = None
+            if hasattr(response.output, 'choices') and response.output.choices:
+                choice = response.output.choices[0]
+                if hasattr(choice, 'message') and hasattr(choice.message, 'content'):
+                    content = str(choice.message.content)  # Ensure content is a string
+                if hasattr(choice, 'finish_reason'):
+                    finish_reason = choice.finish_reason
+            
+            # Create AIMessageChunk
+            message_chunk = AIMessageChunk(
+                content=content,
+                additional_kwargs={},
+                usage_metadata=UsageMetadata(
+                    input_tokens=response.usage.input_tokens if hasattr(response.usage, 'input_tokens') else 0,
+                    output_tokens=response.usage.output_tokens if hasattr(response.usage, 'output_tokens') else 0,
+                    total_tokens=response.usage.total_tokens if hasattr(response.usage, 'total_tokens') else 0
+                ) if hasattr(response, 'usage') else None
+            )
+            
+            # Create ChatGenerationChunk
+            generation_chunk = ChatGenerationChunk(
+                message=message_chunk,
+                generation_info={
+                    "finish_reason": finish_reason,
+                    "model": response.model if hasattr(response, 'model') else self.model_name,
+                    "request_id": response.request_id if hasattr(response, 'request_id') else None
+                }
+            )
+            
+            # Call callback if provided
+            if run_manager:
+                run_manager.on_llm_new_token(
+                    content,
+                    chunk=generation_chunk
+                )
+            
+            yield generation_chunk
 
     def _stream(
         self,
