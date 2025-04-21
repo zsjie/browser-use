@@ -1014,6 +1014,34 @@ class BaseChatDashscope(BaseChatModel):
             
             yield generation_chunk
 
+    def _generate_dashscope(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        if self.streaming:
+            stream_iter = self._stream_dashscope(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            )
+            return generate_from_stream(stream_iter)
+        
+        payload = self._get_request_payload_dashscope(messages, stop=stop, **kwargs)
+
+        if "response_format" in payload:
+            payload.pop("stream")
+            if payload["response_format"]["type"] == "json_schema":
+                warnings.warn(
+                    "JSON Schema response format is not supported in Dashscope."
+                    "You can clearly describe the key-value structure and data types of the required JSON in the prompt, and provide standard data examples."
+                    "This will help the model achieve similar results."
+                )
+            
+        response = Generation.call(**payload)
+
+        return self._create_chat_result_dashscope(cast(GenerationResponse, response))
+
     def _stream(
         self,
         messages: List[BaseMessage],
@@ -1205,6 +1233,44 @@ class BaseChatDashscope(BaseChatModel):
                 generations[0].message.additional_kwargs["parsed"] = message.parsed
             if hasattr(message, "refusal"):
                 generations[0].message.additional_kwargs["refusal"] = message.refusal
+
+        return ChatResult(generations=generations, llm_output=llm_output)
+
+    def _create_chat_result_dashscope(
+        self,
+        response: GenerationResponse,
+    ) -> ChatResult:
+        generations = []
+
+        if response.status_code == 200 and response.output and response.output.choices:
+            choice = response.output.choices[0]
+            content = ""
+            finish_reason = None
+
+            if choice.message and choice.message.content:
+                content = str(choice.message.content)
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+
+            message = AIMessage(content=content)
+            generation = ChatGeneration(message=message, generation_info={"finish_reason": finish_reason})
+
+            generations.append(generation)
+
+        token_usage = {}
+        if hasattr(response, 'usage'):
+            if hasattr(response.usage, 'input_tokens'):
+                token_usage["input_tokens"] = response.usage.input_tokens
+            if hasattr(response.usage, 'output_tokens'):
+                token_usage["output_tokens"] = response.usage.output_tokens
+            if hasattr(response.usage, 'total_tokens'):
+                token_usage["total_tokens"] = response.usage.total_tokens
+
+        llm_output = {
+            "token_usage": token_usage,
+            "model_name": self.model_name,
+            "request_id": response.request_id,
+        }
 
         return ChatResult(generations=generations, llm_output=llm_output)
 
