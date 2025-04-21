@@ -1312,7 +1312,7 @@ class BaseChatDashscope(BaseChatModel):
         response_stream = await AioGeneration.call(**payload)
         
         # 处理异步生成器
-        async for response in response_stream:
+        async for response in response_stream: # type: ignore
             # 提取内容
             content = ""
             finish_reason = None
@@ -1352,6 +1352,33 @@ class BaseChatDashscope(BaseChatModel):
                 )
             
             yield generation_chunk
+
+    async def _agenerate_dashscope(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        if self.streaming:
+            stream_iter = self._astream_dashscope(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            )
+            return await agenerate_from_stream(stream_iter)
+        payload = self._get_request_payload_dashscope(messages, stop=stop, **kwargs)
+
+        if "response_format" in payload:
+            payload.pop("stream")
+            if payload["response_format"]["type"] == "json_schema":
+                warnings.warn(
+                    "JSON Schema response format is not supported in Dashscope."
+                    "You can clearly describe the key-value structure and data types of the required JSON in the prompt, and provide standard data examples."
+                    "This will help the model achieve similar results."
+                )
+
+        response = await AioGeneration.call(**payload)
+
+        return self._create_chat_result_dashscope(cast(GenerationResponse, response))
 
     async def _astream(
         self,
