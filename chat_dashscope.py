@@ -111,7 +111,7 @@ from typing_extensions import Self
 from dashscope.api_entities.dashscope_response import (GenerationResponse,
                                                        Message, Role)
 
-from dashscope import Generation
+from dashscope import (AioGeneration, Generation)
 
 if TYPE_CHECKING:
     from openai.types.responses import Response
@@ -968,6 +968,14 @@ class BaseChatDashscope(BaseChatModel):
             )
 
         payload = self._get_request_payload_dashscope(messages, stop=stop, **kwargs)
+
+        if "response_format" in payload:
+            if payload["response_format"]["type"] == "json_schema":
+                warnings.warn(
+                    "JSON Schema response format is not supported in Dashscope."
+                    "You can clearly describe the key-value structure and data types of the required JSON in the prompt, and provide standard data examples."
+                    "This will help the model achieve similar results."
+                )
         
         # Call Generation API with streaming
         response_stream = Generation.call(**payload)
@@ -1273,6 +1281,77 @@ class BaseChatDashscope(BaseChatModel):
         }
 
         return ChatResult(generations=generations, llm_output=llm_output)
+
+    async def _astream_dashscope(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        *,
+        stream_usage: Optional[bool] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        kwargs["stream"] = True
+
+        if stream_usage is not None:
+            warnings.warn("stream_usage is not supported in Dashscope. "
+                          "Token usage will be included in the response by default."
+            )
+
+        payload = self._get_request_payload_dashscope(messages, stop=stop, **kwargs)
+
+        if "response_format" in payload:
+            if payload["response_format"]["type"] == "json_schema":
+                warnings.warn(
+                    "JSON Schema response format is not supported in Dashscope."
+                    "You can clearly describe the key-value structure and data types of the required JSON in the prompt, and provide standard data examples."
+                    "This will help the model achieve similar results."
+                )
+
+        # AioGeneration.call 返回异步生成器
+        response_stream = await AioGeneration.call(**payload)
+        
+        # 处理异步生成器
+        async for response in response_stream:
+            # 提取内容
+            content = ""
+            finish_reason = None
+            if hasattr(response.output, 'choices') and response.output.choices:
+                choice = response.output.choices[0]
+                if hasattr(choice, 'message') and hasattr(choice.message, 'content'):
+                    content = str(choice.message.content)
+                if hasattr(choice, 'finish_reason'):
+                    finish_reason = choice.finish_reason
+            
+            # 创建 AIMessageChunk
+            message_chunk = AIMessageChunk(
+                content=content,
+                additional_kwargs={},
+                usage_metadata=UsageMetadata(
+                    input_tokens=response.usage.input_tokens if hasattr(response.usage, 'input_tokens') else 0,
+                    output_tokens=response.usage.output_tokens if hasattr(response.usage, 'output_tokens') else 0,
+                    total_tokens=response.usage.total_tokens if hasattr(response.usage, 'total_tokens') else 0
+                ) if hasattr(response, 'usage') else None
+            )
+            
+            # 创建 ChatGenerationChunk
+            generation_chunk = ChatGenerationChunk(
+                message=message_chunk,
+                generation_info={
+                    "finish_reason": finish_reason,
+                    "model": response.model if hasattr(response, 'model') else self.model_name,
+                    "request_id": response.request_id if hasattr(response, 'request_id') else None
+                }
+            )
+            
+            # 调用回调
+            if run_manager:
+                await run_manager.on_llm_new_token(
+                    content,
+                    chunk=generation_chunk
+                )
+            
+            yield generation_chunk
 
     async def _astream(
         self,
