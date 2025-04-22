@@ -1,19 +1,13 @@
 """Dashscope chat wrapper."""
 from __future__ import annotations
 
-import base64
-import json
 import logging
 import os
 import re
 import ssl
-import sys
 import warnings
-from io import BytesIO
-from math import ceil
 from operator import itemgetter
 from typing import (
-    TYPE_CHECKING,
     Any,
     AsyncIterator,
     Callable,
@@ -26,16 +20,12 @@ from typing import (
     Sequence,
     Tuple,
     Type,
-    TypedDict,
     TypeVar,
     Union,
     cast,
 )
-from urllib.parse import urlparse
 
 import certifi
-import openai
-import tiktoken
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
     CallbackManagerForLLMRun,
@@ -53,32 +43,19 @@ from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
     BaseMessage,
-    BaseMessageChunk,
     ChatMessage,
-    ChatMessageChunk,
     FunctionMessage,
-    FunctionMessageChunk,
     HumanMessage,
-    HumanMessageChunk,
-    InvalidToolCall,
     SystemMessage,
-    SystemMessageChunk,
-    ToolCall,
     ToolMessage,
-    ToolMessageChunk,
 )
 from langchain_core.messages.ai import (
-    InputTokenDetails,
-    OutputTokenDetails,
     UsageMetadata,
 )
-from langchain_core.messages.tool import tool_call_chunk
 from langchain_core.output_parsers import JsonOutputParser, PydanticOutputParser
 from langchain_core.output_parsers.openai_tools import (
     JsonOutputKeyToolsParser,
     PydanticToolsParser,
-    make_invalid_tool_call,
-    parse_tool_call,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables import (
@@ -100,12 +77,10 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from typing_extensions import Self
 
 from dashscope.api_entities.dashscope_response import (GenerationResponse,
-                                                       Message, Role)
+                                                       Message)
 
 from dashscope import (AioGeneration, Generation)
 
-if TYPE_CHECKING:
-    from openai.types.responses import Response
 
 logger = logging.getLogger(__name__)
 
@@ -115,239 +90,7 @@ _BM = TypeVar("_BM", bound=BaseModel)
 _DictOrPydanticClass = Union[Dict[str, Any], Type[_BM], Type]
 _DictOrPydantic = Union[Dict, _BM]
 
-def _update_token_usage(
-    overall_token_usage: Union[int, dict], new_usage: Union[int, dict]
-) -> Union[int, dict]:
-    # Token usage is either ints or dictionaries
-    # `reasoning_tokens` is nested inside `completion_tokens_details`
-    if isinstance(new_usage, int):
-        if not isinstance(overall_token_usage, int):
-            raise ValueError(
-                f"Got different types for token usage: "
-                f"{type(new_usage)} and {type(overall_token_usage)}"
-            )
-        return new_usage + overall_token_usage
-    elif isinstance(new_usage, dict):
-        if not isinstance(overall_token_usage, dict):
-            raise ValueError(
-                f"Got different types for token usage: "
-                f"{type(new_usage)} and {type(overall_token_usage)}"
-            )
-        return {
-            k: _update_token_usage(overall_token_usage.get(k, 0), v)
-            for k, v in new_usage.items()
-        }
-    else:
-        warnings.warn(f"Unexpected type for token usage: {type(new_usage)}")
-        return new_usage
-
-def _create_usage_metadata(oai_token_usage: dict) -> UsageMetadata:
-    input_tokens = oai_token_usage.get("prompt_tokens", 0)
-    output_tokens = oai_token_usage.get("completion_tokens", 0)
-    total_tokens = oai_token_usage.get("total_tokens", input_tokens + output_tokens)
-    input_token_details: dict = {
-        "audio": (oai_token_usage.get("prompt_tokens_details") or {}).get(
-            "audio_tokens"
-        ),
-        "cache_read": (oai_token_usage.get("prompt_tokens_details") or {}).get(
-            "cached_tokens"
-        ),
-    }
-    output_token_details: dict = {
-        "audio": (oai_token_usage.get("completion_tokens_details") or {}).get(
-            "audio_tokens"
-        ),
-        "reasoning": (oai_token_usage.get("completion_tokens_details") or {}).get(
-            "reasoning_tokens"
-        ),
-    }
-    return UsageMetadata(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        total_tokens=total_tokens,
-        input_token_details=InputTokenDetails(
-            **{k: v for k, v in input_token_details.items() if v is not None}
-        ),
-        output_token_details=OutputTokenDetails(
-            **{k: v for k, v in output_token_details.items() if v is not None}
-        ),
-    )
-
-def _convert_delta_to_message_chunk(
-    _dict: Mapping[str, Any], default_class: Type[BaseMessageChunk]
-) -> BaseMessageChunk:
-    id_ = _dict.get("id")
-    role = cast(str, _dict.get("role"))
-    content = cast(str, _dict.get("content") or "")
-    additional_kwargs: Dict = {}
-    if _dict.get("function_call"):
-        function_call = dict(_dict["function_call"])
-        if "name" in function_call and function_call["name"] is None:
-            function_call["name"] = ""
-        additional_kwargs["function_call"] = function_call
-    tool_call_chunks = []
-    if raw_tool_calls := _dict.get("tool_calls"):
-        additional_kwargs["tool_calls"] = raw_tool_calls
-        try:
-            tool_call_chunks = [
-                tool_call_chunk(
-                    name=rtc["function"].get("name"),
-                    args=rtc["function"].get("arguments"),
-                    id=rtc.get("id"),
-                    index=rtc["index"],
-                )
-                for rtc in raw_tool_calls
-            ]
-        except KeyError:
-            pass
-
-    if role == "user" or default_class == HumanMessageChunk:
-        return HumanMessageChunk(content=content, id=id_)
-    elif role == "assistant" or default_class == AIMessageChunk:
-        return AIMessageChunk(
-            content=content,
-            additional_kwargs=additional_kwargs,
-            id=id_,
-            tool_call_chunks=tool_call_chunks,  # type: ignore[arg-type]
-        )
-    elif role in ("system", "developer") or default_class == SystemMessageChunk:
-        if role == "developer":
-            additional_kwargs = {"__openai_role__": "developer"}
-        else:
-            additional_kwargs = {}
-        return SystemMessageChunk(
-            content=content, id=id_, additional_kwargs=additional_kwargs
-        )
-    elif role == "function" or default_class == FunctionMessageChunk:
-        return FunctionMessageChunk(content=content, name=_dict["name"], id=id_)
-    elif role == "tool" or default_class == ToolMessageChunk:
-        return ToolMessageChunk(
-            content=content, tool_call_id=_dict["tool_call_id"], id=id_
-        )
-    elif role or default_class == ChatMessageChunk:
-        return ChatMessageChunk(content=content, role=role, id=id_)
-    else:
-        return default_class(content=content, id=id_)  # type: ignore
-
-def _convert_message_to_dict(message: BaseMessage) -> dict:
-    """Convert a LangChain message to a dictionary.
-
-    Args:
-        message: The LangChain message.
-
-    Returns:
-        The dictionary.
-    """
-    message_dict: Dict[str, Any] = {"content": _format_message_content(message.content)}
-    if (name := message.name or message.additional_kwargs.get("name")) is not None:
-        message_dict["name"] = name
-
-    # populate role and additional message data
-    if isinstance(message, ChatMessage):
-        message_dict["role"] = message.role
-    elif isinstance(message, HumanMessage):
-        message_dict["role"] = "user"
-    elif isinstance(message, AIMessage):
-        message_dict["role"] = "assistant"
-        if "function_call" in message.additional_kwargs:
-            message_dict["function_call"] = message.additional_kwargs["function_call"]
-        if message.tool_calls or message.invalid_tool_calls:
-            message_dict["tool_calls"] = [
-                _lc_tool_call_to_openai_tool_call(tc) for tc in message.tool_calls
-            ] + [
-                _lc_invalid_tool_call_to_openai_tool_call(tc)
-                for tc in message.invalid_tool_calls
-            ]
-        elif "tool_calls" in message.additional_kwargs:
-            message_dict["tool_calls"] = message.additional_kwargs["tool_calls"]
-            tool_call_supported_props = {"id", "type", "function"}
-            message_dict["tool_calls"] = [
-                {k: v for k, v in tool_call.items() if k in tool_call_supported_props}
-                for tool_call in message_dict["tool_calls"]
-            ]
-        else:
-            pass
-        # If tool calls present, content null value should be None not empty string.
-        if "function_call" in message_dict or "tool_calls" in message_dict:
-            message_dict["content"] = message_dict["content"] or None
-
-        if "audio" in message.additional_kwargs:
-            # openai doesn't support passing the data back - only the id
-            # https://platform.openai.com/docs/guides/audio/multi-turn-conversations
-            raw_audio = message.additional_kwargs["audio"]
-            audio = (
-                {"id": message.additional_kwargs["audio"]["id"]}
-                if "id" in raw_audio
-                else raw_audio
-            )
-            message_dict["audio"] = audio
-    elif isinstance(message, SystemMessage):
-        message_dict["role"] = message.additional_kwargs.get(
-            "__openai_role__", "system"
-        )
-    elif isinstance(message, FunctionMessage):
-        message_dict["role"] = "function"
-    elif isinstance(message, ToolMessage):
-        message_dict["role"] = "tool"
-        message_dict["tool_call_id"] = message.tool_call_id
-
-        supported_props = {"content", "role", "tool_call_id"}
-        message_dict = {k: v for k, v in message_dict.items() if k in supported_props}
-    else:
-        raise TypeError(f"Got unknown type {message}")
-    return message_dict
-
-def _format_message_content(content: Any) -> Any:
-    """Format message content."""
-    if content and isinstance(content, list):
-        formatted_content = []
-        for block in content:
-            # Remove unexpected block types
-            if (
-                isinstance(block, dict)
-                and "type" in block
-                and block["type"] in ("tool_use", "thinking")
-            ):
-                continue
-            # Anthropic image blocks
-            elif (
-                isinstance(block, dict)
-                and block.get("type") == "image"
-                and (source := block.get("source"))
-                and isinstance(source, dict)
-            ):
-                if source.get("type") == "base64" and (
-                    (media_type := source.get("media_type"))
-                    and (data := source.get("data"))
-                ):
-                    formatted_content.append(
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{media_type};base64,{data}"},
-                        }
-                    )
-                elif source.get("type") == "url" and (url := source.get("url")):
-                    formatted_content.append(
-                        {"type": "image_url", "image_url": {"url": url}}
-                    )
-                else:
-                    continue
-            else:
-                formatted_content.append(block)
-    else:
-        formatted_content = content
-
-    return formatted_content
-
-
-
 class BaseChatDashscope(BaseChatModel):
-    client: Any = Field(default=None, exclude=True)  #: :meta private:
-    async_client: Any = Field(default=None, exclude=True)  #: :meta private:
-    root_client: Any = Field(default=None, exclude=True)  #: :meta private:
-    root_async_client: Any = Field(default=None, exclude=True)  #: :meta private:
-
-
     model_name: str = Field(default="qwen-turbo", alias="model")
     """Model name to use."""
     temperature: Optional[float] = None
@@ -425,13 +168,6 @@ class BaseChatDashscope(BaseChatModel):
     default_query: Union[Mapping[str, object], None] = None
     # Configure a custom httpx client. See the
     # [httpx documentation](https://www.python-httpx.org/api/#client) for more details.
-    http_client: Union[Any, None] = Field(default=None, exclude=True)
-    """Optional httpx.Client. Only used for sync invocations. Must specify 
-        http_async_client as well if you'd like a custom client for async invocations.
-    """
-    http_async_client: Union[Any, None] = Field(default=None, exclude=True)
-    """Optional httpx.AsyncClient. Only used for async invocations. Must specify 
-        http_client as well if you'd like a custom client for sync invocations."""
     stop: Optional[Union[List[str], str]] = Field(default=None, alias="stop_sequences")
     """Default stop sequences."""
     extra_body: Optional[Mapping[str, Any]] = None
@@ -528,46 +264,7 @@ class BaseChatDashscope(BaseChatModel):
         }
         if self.max_retries is not None:
             client_params["max_retries"] = self.max_retries
-        
-        if self.dashscope_proxy and (self.http_client or self.http_async_client):
-            dashscope_proxy = self.dashscope_proxy
-            http_client = self.http_client
-            http_async_client = self.http_async_client
-            raise ValueError(
-                "Cannot specify 'dashscope_proxy' if one of "
-                "'http_client'/'http_async_client' is already specified. Received:\n"
-                f"{dashscope_proxy=}\n{http_client=}\n{http_async_client=}"
-            )
-        if not self.client:
-            if self.dashscope_proxy and not self.http_client:
-                try:
-                    import httpx
-                except ImportError as e:
-                    raise ImportError(
-                        "Could not import httpx python package. "
-                        "Please install it with `pip install httpx`."
-                    ) from e
-                self.http_client = httpx.Client(
-                    proxy=self.dashscope_proxy, verify=global_ssl_context
-                )
-            sync_specific = {"http_client": self.http_client}
-            self.root_client = openai.OpenAI(**client_params, **sync_specific) # type: ignore
-            self.client = self.root_client.chat.completions
-        if not self.async_client:
-            if self.dashscope_proxy and not self.http_async_client:
-                try:
-                    import httpx
-                except ImportError as e:
-                    raise ImportError(
-                        "Could not import httpx python package. "
-                        "Please install it with `pip install httpx`."
-                    ) from e
-                self.http_async_client = httpx.AsyncClient(
-                    proxy=self.dashscope_proxy, verify=global_ssl_context
-                )
-                async_specific = {"http_client": self.http_async_client}
-                self.root_async_client = openai.AsyncOpenAI(**client_params, **async_specific) # type: ignore
-                self.async_client = self.root_async_client.chat.completions
+
         return self
 
     @property
@@ -594,103 +291,6 @@ class BaseChatDashscope(BaseChatModel):
             **{k: v for k, v in exclude_if_none.items() if v is not None},
         }
         return params
-    
-    def _combine_llm_outputs(self, llm_outputs: List[Optional[dict]]) -> dict:
-        overall_token_usage: dict = {}
-        system_fingerprint = None
-        for output in llm_outputs:
-            if output is None:
-                # Happens in streaming
-                continue
-            token_usage = output.get("token_usage")
-            if token_usage is not None:
-                for k, v in token_usage.items():
-                    if v is None:
-                        continue
-                    if k in overall_token_usage:
-                        overall_token_usage[k] = _update_token_usage(
-                            overall_token_usage[k], v
-                        )
-                    else:
-                        overall_token_usage[k] = v
-            if system_fingerprint is None:
-                system_fingerprint = output.get("system_fingerprint")
-        combined = {"token_usage": overall_token_usage, "model_name": self.model_name}
-        if system_fingerprint:
-            combined["system_fingerprint"] = system_fingerprint
-        return combined
-    
-    def _convert_chunk_to_generation_chunk(
-        self,
-        chunk: dict,
-        default_chunk_class: Type,
-        base_generation_info: Optional[Dict],
-    ) -> Optional[ChatGenerationChunk]:
-        if chunk.get("type") == "content.delta":  # from beta.chat.completions.stream
-            return None
-        token_usage = chunk.get("usage")
-        choices = (
-            chunk.get("choices", [])
-            # from beta.chat.completions.stream
-            or chunk.get("chunk", {}).get("choices", [])
-        )
-
-        usage_metadata: Optional[UsageMetadata] = (
-            _create_usage_metadata(token_usage) if token_usage else None
-        )
-        if len(choices) == 0:
-            # logprobs is implicitly None
-            generation_chunk = ChatGenerationChunk(
-                message=default_chunk_class(content="", usage_metadata=usage_metadata)
-            )
-            return generation_chunk
-        
-        choice = choices[0]
-        if choice["delta"] is None:
-            return None
-        
-        message_chunk = _convert_delta_to_message_chunk(
-            choice["delta"], default_chunk_class
-        )
-        generation_info = {**base_generation_info} if base_generation_info else {}
-
-        if finish_reason := choice.get("finish_reason"):
-            generation_info["finish_reason"] = finish_reason
-            if model_name := chunk.get("model"):
-                generation_info["model_name"] = model_name
-            if system_fingerprint := chunk.get("system_fingerprint"):
-                generation_info["system_fingerprint"] = system_fingerprint
-
-        logprobs = choice.get("logprobs")
-        if logprobs:
-            generation_info["logprobs"] = logprobs
-
-        if usage_metadata and isinstance(message_chunk, AIMessageChunk):
-            message_chunk.usage_metadata = usage_metadata
-
-        generation_chunk = ChatGenerationChunk(
-            message=message_chunk, generation_info=generation_info or None
-        )
-        return generation_chunk
-
-    def _should_stream_usage(
-        self, stream_usage: Optional[bool] = None, **kwargs: Any
-    ) -> bool:
-        """Determine whether to include usage metadata in streaming output.
-
-        For backwards compatibility, we check for `stream_options` passed
-        explicitly to kwargs or in the model_kwargs and override self.stream_usage.
-        """
-        stream_usage_sources = [  # order of precedence
-            stream_usage,
-            kwargs.get("stream_options", {}).get("include_usage"),
-            self.model_kwargs.get("stream_options", {}).get("include_usage"),
-            self.stream_usage,
-        ]
-        for source in stream_usage_sources:
-            if isinstance(source, bool):
-                return source
-        return self.stream_usage
 
     def _get_dashscope_role(self, message: BaseMessage) -> str:
         if isinstance(message, HumanMessage):
@@ -838,12 +438,6 @@ class BaseChatDashscope(BaseChatModel):
 
         return self._create_chat_result(cast(GenerationResponse, response))
 
-    def _use_responses_api(self, payload: dict) -> bool:
-        if isinstance(self.use_responses_api, bool):
-            return self.use_responses_api
-        else:
-            return _use_responses_api(payload)
-
     def _create_chat_result(
         self,
         response: GenerationResponse,
@@ -910,7 +504,7 @@ class BaseChatDashscope(BaseChatModel):
 
         # AioGeneration.call 返回异步生成器
         response_stream = await AioGeneration.call(**payload)
-        
+
         # 处理异步生成器
         async for response in response_stream: # type: ignore
             # 提取内容
@@ -933,7 +527,7 @@ class BaseChatDashscope(BaseChatModel):
                     total_tokens=response.usage.total_tokens if hasattr(response.usage, 'total_tokens') else 0
                 ) if hasattr(response, 'usage') else None
             )
-            
+
             # 创建 ChatGenerationChunk
             generation_chunk = ChatGenerationChunk(
                 message=message_chunk,
@@ -995,7 +589,7 @@ class BaseChatDashscope(BaseChatModel):
             **self._default_params,
             **kwargs,
         }
-    
+
     def _get_ls_params(
         self, stop: Optional[List[str]] = None, **kwargs: Any
     ) -> LangSmithParams:
@@ -1018,123 +612,8 @@ class BaseChatDashscope(BaseChatModel):
     @property
     def _llm_type(self) -> str:
         """Return type of chat model."""
-        return "openai-chat"
-    
-    def _get_encoding_model(self) -> Tuple[str, tiktoken.Encoding]:
-        if self.tiktoken_model_name is not None:
-            model = self.tiktoken_model_name
-        else:
-            model = self.model_name
-        try:
-            encoding = tiktoken.encoding_for_model(model)
-        except KeyError:
-            model = "cl100k_base"
-            encoding = tiktoken.get_encoding(model)
-        return model, encoding
-    
-    def get_token_ids(self, text: str) -> List[int]:
-        """Get the tokens present in the text with tiktoken package."""
-        if self.custom_get_token_ids is not None:
-            return self.custom_get_token_ids(text)
-        # tiktoken NOT supported for Python 3.7 or below
-        if sys.version_info[1] <= 7:
-            return super().get_token_ids(text)
-        _, encoding_model = self._get_encoding_model()
-        return encoding_model.encode(text)
-    
-    def get_num_tokens_from_messages(
-        self,
-        messages: List[BaseMessage],
-        tools: Optional[
-            Sequence[Union[Dict[str, Any], Type, Callable, BaseTool]]
-        ] = None,
-    ) -> int:
-        """Calculate num tokens for gpt-3.5-turbo and gpt-4 with tiktoken package.
+        return "dashscope-chat"
 
-        **Requirements**: You must have the ``pillow`` installed if you want to count
-        image tokens if you are specifying the image as a base64 string, and you must
-        have both ``pillow`` and ``httpx`` installed if you are specifying the image
-        as a URL. If these aren't installed image inputs will be ignored in token
-        counting.
-
-        OpenAI reference: https://github.com/openai/openai-cookbook/blob/
-        main/examples/How_to_format_inputs_to_ChatGPT_models.ipynb
-
-        Args:
-            messages: The message inputs to tokenize.
-            tools: If provided, sequence of dict, BaseModel, function, or BaseTools
-                to be converted to tool schemas.
-        """
-        # TODO: Count bound tools as part of input.
-        if tools is not None:
-            warnings.warn(
-                "Counting tokens in tool schemas is not yet supported. Ignoring tools."
-            )
-        if sys.version_info[1] <= 7:
-            return super().get_num_tokens_from_messages(messages)
-        model, encoding = self._get_encoding_model()
-        if model.startswith("gpt-3.5-turbo-0301"):
-            # every message follows <im_start>{role/name}\n{content}<im_end>\n
-            tokens_per_message = 4
-            # if there's a name, the role is omitted
-            tokens_per_name = -1
-        elif model.startswith("gpt-3.5-turbo") or model.startswith("gpt-4"):
-            tokens_per_message = 3
-            tokens_per_name = 1
-        else:
-            raise NotImplementedError(
-                f"get_num_tokens_from_messages() is not presently implemented "
-                f"for model {model}. See "
-                "https://platform.openai.com/docs/guides/text-generation/managing-tokens"  # noqa: E501
-                " for information on how messages are converted to tokens."
-            )
-        num_tokens = 0
-        messages_dict = [_convert_message_to_dict(m) for m in messages]
-        for message in messages_dict:
-            num_tokens += tokens_per_message
-            for key, value in message.items():
-                # This is an inferred approximation. OpenAI does not document how to
-                # count tool message tokens.
-                if key == "tool_call_id":
-                    num_tokens += 3
-                    continue
-                if isinstance(value, list):
-                    # content or tool calls
-                    for val in value:
-                        if isinstance(val, str) or val["type"] == "text":
-                            text = val["text"] if isinstance(val, dict) else val
-                            num_tokens += len(encoding.encode(text))
-                        elif val["type"] == "image_url":
-                            if val["image_url"].get("detail") == "low":
-                                num_tokens += 85
-                            else:
-                                image_size = _url_to_size(val["image_url"]["url"])
-                                if not image_size:
-                                    continue
-                                num_tokens += _count_image_tokens(*image_size)
-                        # Tool/function call token counting is not documented by OpenAI.
-                        # This is an approximation.
-                        elif val["type"] == "function":
-                            num_tokens += len(
-                                encoding.encode(val["function"]["arguments"])
-                            )
-                            num_tokens += len(encoding.encode(val["function"]["name"]))
-                        else:
-                            raise ValueError(
-                                f"Unrecognized content block type\n\n{val}"
-                            )
-                elif not value:
-                    continue
-                else:
-                    # Cast str(value) in case the message value is not a string
-                    # This occurs with function messages
-                    num_tokens += len(encoding.encode(str(value)))
-                if key == "name":
-                    num_tokens += tokens_per_name
-        # every reply is primed with <im_start>assistant
-        num_tokens += 3
-        return num_tokens
-    
     def bind_tools(
         self,
         tools: Sequence[Union[Dict[str, Any], Type, Callable, BaseTool]],
@@ -1481,111 +960,8 @@ class ChatDashscope(BaseChatDashscope):  # type: ignore[override]
             schema, method=method, include_raw=include_raw, strict=strict, **kwargs
         )
 
-def _is_builtin_tool(tool: dict) -> bool:
-    return "type" in tool and tool["type"] != "function"
-
-def _use_responses_api(payload: dict) -> bool:
-    uses_builtin_tools = "tools" in payload and any(
-        _is_builtin_tool(tool) for tool in payload["tools"]
-    )
-    responses_only_args = {"previous_response_id", "text", "truncation", "include"}
-    return bool(uses_builtin_tools or responses_only_args.intersection(payload))
-
 def _is_pydantic_class(obj: Any) -> bool:
     return isinstance(obj, type) and is_basemodel_subclass(obj)
-
-def _lc_tool_call_to_openai_tool_call(tool_call: ToolCall) -> dict:
-    return {
-        "type": "function",
-        "id": tool_call["id"],
-        "function": {
-            "name": tool_call["name"],
-            "arguments": json.dumps(tool_call["args"]),
-        },
-    }
-
-
-def _lc_invalid_tool_call_to_openai_tool_call(
-    invalid_tool_call: InvalidToolCall,
-) -> dict:
-    return {
-        "type": "function",
-        "id": invalid_tool_call["id"],
-        "function": {
-            "name": invalid_tool_call["name"],
-            "arguments": invalid_tool_call["args"],
-        },
-    }
-
-def _url_to_size(image_source: str) -> Optional[Tuple[int, int]]:
-    try:
-        from PIL import Image  # type: ignore[import]
-    except ImportError:
-        logger.info(
-            "Unable to count image tokens. To count image tokens please install "
-            "`pip install -U pillow httpx`."
-        )
-        return None
-    if _is_url(image_source):
-        try:
-            import httpx
-        except ImportError:
-            logger.info(
-                "Unable to count image tokens. To count image tokens please install "
-                "`pip install -U httpx`."
-            )
-            return None
-        response = httpx.get(image_source)
-        response.raise_for_status()
-        width, height = Image.open(BytesIO(response.content)).size
-        return width, height
-    elif _is_b64(image_source):
-        _, encoded = image_source.split(",", 1)
-        data = base64.b64decode(encoded)
-        width, height = Image.open(BytesIO(data)).size
-        return width, height
-    else:
-        return None
-
-
-def _count_image_tokens(width: int, height: int) -> int:
-    # Reference: https://platform.openai.com/docs/guides/vision/calculating-costs
-    width, height = _resize(width, height)
-    h = ceil(height / 512)
-    w = ceil(width / 512)
-    return (170 * h * w) + 85
-
-def _is_url(s: str) -> bool:
-    try:
-        result = urlparse(s)
-        return all([result.scheme, result.netloc])
-    except Exception as e:
-        logger.debug(f"Unable to parse URL: {e}")
-        return False
-
-
-def _is_b64(s: str) -> bool:
-    return s.startswith("data:image")
-
-
-def _resize(width: int, height: int) -> Tuple[int, int]:
-    # larger side must be <= 2048
-    if width > 2048 or height > 2048:
-        if width > height:
-            height = (height * 2048) // width
-            width = 2048
-        else:
-            width = (width * 2048) // height
-            height = 2048
-    # smaller side must be <= 768
-    if width > 768 and height > 768:
-        if width > height:
-            width = (width * 768) // height
-            height = 768
-        else:
-            height = (width * 768) // height
-            width = 768
-    return width, height
 
 def convert_to_dashscope_tool(
     tool: Union[dict[str, Any], type[BaseModel], Callable, BaseTool],
@@ -1597,14 +973,3 @@ def convert_to_dashscope_tool(
             return tool
     return convert_to_openai_function(tool, strict=strict)
 
-class OpenAIRefusalError(Exception):
-    """Error raised when OpenAI Structured Outputs API returns a refusal.
-
-    When using OpenAI's Structured Outputs API with user-generated input, the model
-    may occasionally refuse to fulfill the request for safety reasons.
-
-    See here for more on refusals:
-    https://platform.openai.com/docs/guides/structured-outputs/refusals
-
-    .. versionadded:: 0.1.21
-    """
