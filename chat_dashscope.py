@@ -209,9 +209,6 @@ class BaseChatDashscope(BaseChatModel):
     workspace: Optional[str] = None
     """DashScope工作空间ID"""
 
-    stream: Optional[bool] = False
-    """是否启用服务器发送事件，默认为False"""
-
     top_k: Optional[int] = 0
     """生成时的候选集大小，默认为0"""
 
@@ -360,7 +357,7 @@ class BaseChatDashscope(BaseChatModel):
         if "response_format" in payload:
             if payload["response_format"]["type"] == "json_schema":
                 warnings.warn(
-                    "JSON Schema response format is not supported in Dashscope."
+                    "_stream: JSON Schema response format is not supported in Dashscope."
                     "You can clearly describe the key-value structure and data types of the required JSON in the prompt, and provide standard data examples."
                     "This will help the model achieve similar results."
                 )
@@ -429,7 +426,7 @@ class BaseChatDashscope(BaseChatModel):
             payload.pop("stream")
             if payload["response_format"]["type"] == "json_schema":
                 warnings.warn(
-                    "JSON Schema response format is not supported in Dashscope."
+                    "_generate: JSON Schema response format is not supported in Dashscope."
                     "You can clearly describe the key-value structure and data types of the required JSON in the prompt, and provide standard data examples."
                     "This will help the model achieve similar results."
                 )
@@ -485,6 +482,7 @@ class BaseChatDashscope(BaseChatModel):
         stream_usage: Optional[bool] = None,
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
+        logger.info("astream")
         kwargs["stream"] = True
 
         if stream_usage is not None:
@@ -497,7 +495,7 @@ class BaseChatDashscope(BaseChatModel):
         if "response_format" in payload:
             if payload["response_format"]["type"] == "json_schema":
                 warnings.warn(
-                    "JSON Schema response format is not supported in Dashscope."
+                    "_astream: JSON Schema response format is not supported in Dashscope."
                     "You can clearly describe the key-value structure and data types of the required JSON in the prompt, and provide standard data examples."
                     "This will help the model achieve similar results."
                 )
@@ -555,24 +553,36 @@ class BaseChatDashscope(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         if self.streaming:
+            logger.info("调用streaming模式 ================================")
             stream_iter = self._astream(
                 messages, stop=stop, run_manager=run_manager, **kwargs
             )
             return await agenerate_from_stream(stream_iter)
+        
         payload = self._get_request_payload(messages, stop=stop, **kwargs)
+        payload.pop("stream")
 
         if "response_format" in payload:
-            payload.pop("stream")
             if payload["response_format"]["type"] == "json_schema":
                 warnings.warn(
-                    "JSON Schema response format is not supported in Dashscope."
+                    "_agenerate: JSON Schema response format is not supported in Dashscope."
                     "You can clearly describe the key-value structure and data types of the required JSON in the prompt, and provide standard data examples."
                     "This will help the model achieve similar results."
                 )
 
-        response = await AioGeneration.call(**payload)
+        logger.info("调用AioGeneration.call ================================")
+        response_generator = await AioGeneration.call(**payload)
 
-        return self._create_chat_result(cast(GenerationResponse, response))
+        # 处理异步生成器，获取最后一个响应作为完整响应
+        final_response = None
+        async for response in response_generator: # type: ignore
+            final_response = response
+        
+        if final_response is None:
+            raise ValueError("没有从生成器中获取到响应")
+        
+        logger.info("处理完成的响应 ================================")
+        return self._create_chat_result(cast(GenerationResponse, final_response))
 
     @property
     def _identifying_params(self) -> Dict[str, Any]:
@@ -596,7 +606,7 @@ class BaseChatDashscope(BaseChatModel):
         """Get standard params for tracing."""
         params = self._get_invocation_params(stop=stop, **kwargs)
         ls_params = LangSmithParams(
-            ls_provider="openai",
+            ls_provider="dashscope",
             ls_model_name=self.model_name,
             ls_model_type="chat",
             ls_temperature=params.get("temperature", self.temperature),
@@ -805,7 +815,7 @@ class BaseChatDashscope(BaseChatModel):
 
         if method == "json_schema":
             warnings.warn(
-                    "JSON Schema response format is not supported in Dashscope."
+                    "_with_structured_output: JSON Schema response format is not supported in Dashscope."
                     "You can clearly describe the key-value structure and data types of the required JSON in the prompt, and provide standard data examples."
                     "This will help the model achieve similar results."
                 )
@@ -818,6 +828,7 @@ class BaseChatDashscope(BaseChatModel):
                     "Received None."
                 )
             tool_name = convert_to_dashscope_tool(schema)["function"]["name"]
+            print("_with_structured_output: tool_name", tool_name)
             bind_kwargs = self._filter_disabled_params(
                 tool_choice=tool_name,
                 parallel_tool_calls=False,
@@ -971,5 +982,6 @@ def convert_to_dashscope_tool(
     if isinstance(tool, dict):
         if tool.get("type") in ("function", "search", "wanx", "code_interpreter"):
             return tool
-    return convert_to_openai_function(tool, strict=strict)
+    oai_function = convert_to_openai_function(tool, strict=strict)
+    return {"type": "function", "function": oai_function}
 
