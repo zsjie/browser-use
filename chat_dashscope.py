@@ -1728,9 +1728,9 @@ class BaseChatDashscope(BaseChatModel):
                         "function": {"name": tool_choice},
                     }
                 elif tool_choice in (
-                    "file_search",
-                    "web_search_preview",
-                    "computer_use_preview",
+                    "code_interpreter",
+                    "wanx",
+                    "search",
                 ):
                     tool_choice = {"type": tool_choice}
                 # 'any' is not natively supported by OpenAI API.
@@ -1851,32 +1851,12 @@ class BaseChatDashscope(BaseChatModel):
         is_pydantic_schema = _is_pydantic_class(schema)
 
         if method == "json_schema":
-            # Check for Pydantic BaseModel V1
-            if (
-                is_pydantic_schema and issubclass(schema, BaseModelV1)  # type: ignore[arg-type]
-            ):
-                warnings.warn(
-                    "Received a Pydantic BaseModel V1 schema. This is not supported by "
-                    'method="json_schema". Please use method="function_calling" '
-                    "or specify schema via JSON Schema or Pydantic V2 BaseModel. "
-                    'Overriding to method="function_calling".'
+            warnings.warn(
+                    "JSON Schema response format is not supported in Dashscope."
+                    "You can clearly describe the key-value structure and data types of the required JSON in the prompt, and provide standard data examples."
+                    "This will help the model achieve similar results."
                 )
-                method = "function_calling"
-            # Check for incompatible model
-            if self.model_name and (
-                self.model_name.startswith("gpt-3")
-                or self.model_name.startswith("gpt-4-")
-                or self.model_name == "gpt-4"
-            ):
-                warnings.warn(
-                    f"Cannot use method='json_schema' with model {self.model_name} "
-                    f"since it doesn't support OpenAI's Structured Output API. You can "
-                    f"see supported models here: "
-                    f"https://platform.openai.com/docs/guides/structured-outputs#supported-models. "  # noqa: E501
-                    "To fix this warning, set `method='function_calling'. "
-                    "Overriding to method='function_calling'."
-                )
-                method = "function_calling"
+            method = "function_calling"
 
         if method == "function_calling":
             if schema is None:
@@ -1884,7 +1864,7 @@ class BaseChatDashscope(BaseChatModel):
                     "schema must be specified when method is not 'json_mode'. "
                     "Received None."
                 )
-            tool_name = convert_to_openai_tool(schema)["function"]["name"]
+            tool_name = convert_to_dashscope_tool(schema)["function"]["name"]
             bind_kwargs = self._filter_disabled_params(
                 tool_choice=tool_name,
                 parallel_tool_calls=False,
@@ -1918,26 +1898,6 @@ class BaseChatDashscope(BaseChatModel):
                 if is_pydantic_schema
                 else JsonOutputParser()
             )
-        elif method == "json_schema":
-            if schema is None:
-                raise ValueError(
-                    "schema must be specified when method is not 'json_mode'. "
-                    "Received None."
-                )
-            response_format = _convert_to_openai_response_format(schema, strict=strict)
-            llm = self.bind(
-                response_format=response_format,
-                ls_structured_output_format={
-                    "kwargs": {"method": method, "strict": strict},
-                    "schema": convert_to_openai_tool(schema),
-                },
-            )
-            if is_pydantic_schema:
-                output_parser = RunnableLambda(
-                    partial(_oai_structured_outputs_parser, schema=cast(type, schema)) # type: ignore
-                ).with_types(output_type=cast(type, schema))
-            else:
-                output_parser = JsonOutputParser()
         else:
             raise ValueError(
                 f"Unrecognized method argument. Expected one of 'function_calling' or "
@@ -2713,6 +2673,16 @@ def _oai_structured_outputs_parser(
             "Structured Output response does not have a 'parsed' field nor a 'refusal' "
             f"field. Received message:\n\n{ai_msg}"
         )
+
+def convert_to_dashscope_tool(
+    tool: Union[dict[str, Any], type[BaseModel], Callable, BaseTool],
+    *,
+    strict: Optional[bool] = None,
+) -> dict[str, Any]:
+    if isinstance(tool, dict):
+        if tool.get("type") in ("function", "search", "wanx", "code_interpreter"):
+            return tool
+    return convert_to_openai_function(tool, strict=strict)
 
 class OpenAIRefusalError(Exception):
     """Error raised when OpenAI Structured Outputs API returns a refusal.
